@@ -1,3 +1,13 @@
+openasr-*/
+*.wav
+*.mp3
+*.webm
+*.mp4
+*.mkv
+*.opus
+*.vtt
+*.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

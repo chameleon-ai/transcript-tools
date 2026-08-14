@@ -1,0 +1,428 @@
+import argparse
+import io
+import json
+import mimetypes
+import os
+import platform
+import random
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import urllib.parse
+import uuid
+
+def fetch_models(base_url: str = "http://127.0.0.1:8080/v1") -> list[str]:
+    """Fetch available model IDs from the OpenASR server."""
+    url = f"{base_url}/models"
+    with urllib.request.urlopen(url) as resp:
+        data = json.load(resp)
+    return [m["id"] for m in data["data"]]
+
+
+def _encode_multipart(fields: dict, file_field: tuple) -> tuple[bytes, str]:
+    """Encode multipart/form-data body for file upload."""
+    boundary = "----OpenASRBoundary" + str(random.randint(0, 1_000_000))
+    buf = io.BytesIO()
+    def write(s: bytes):
+        buf.write(s)
+    for key, value in fields.items():
+        if isinstance(value, (list, tuple)):
+            for v in value:
+                write(f"--{boundary}\r\n".encode())
+                write(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+                write(str(v).encode())
+                write(b"\r\n")
+        else:
+            write(f"--{boundary}\r\n".encode())
+            write(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+            write(str(value).encode())
+            write(b"\r\n")
+    field_name, (filename, data_bytes, mime_type) = file_field
+    write(f"--{boundary}\r\n".encode())
+    if mime_type is None:
+        mime_type = "application/octet-stream"
+    write(
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode()
+    )
+    write(f"Content-Type: {mime_type}\r\n\r\n".encode())
+    if isinstance(data_bytes, bytes):
+        buf.write(data_bytes)
+    else:
+        buf.write(data_bytes.read())
+    buf.write(b"\r\n")
+    write(f"--{boundary}--\r\n".encode())
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return buf.getvalue(), content_type
+
+
+def poll_progress(
+    session_id: str, stop_event: threading.Event, port: int = 8080
+) -> None:
+    """Poll /v1/audio/transcriptions/{session_id}/progress until done."""
+    url = (
+        f"http://127.0.0.1:{port}/v1/audio/transcriptions/{session_id}/progress"
+    )
+    last_pct = -1
+
+    deadline = time.monotonic() + 900
+
+    while not stop_event.is_set() and time.monotonic() < deadline:
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                #status = resp.status
+                data_bytes = resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                time.sleep(1.0)
+                continue
+            time.sleep(1.0)
+            continue
+        except (urllib.error.URLError, TimeoutError):
+            time.sleep(1.0)
+            continue
+
+        data = json.loads(data_bytes)
+        phase = str(data.get("phase") or "?idle")
+        fraction = float(data.get("fraction", 0))
+        pct = int(fraction * 100)
+
+        if stop_event.is_set():
+            break
+
+        if pct != last_pct:
+            print(f"\rProgress: {pct:>3d}%  phase: {phase}    ", end="", flush=True)
+            last_pct = pct
+
+        time.sleep(1.0)
+
+
+def fmt_time(s: float) -> str:
+    """Format time in seconds to WebVTT time format HH:MM:SS.mmm."""
+    total_ms = int(round(s * 1000))
+
+    h = total_ms // (3600 * 1000)
+    total_ms %= (3600 * 1000)
+    m = total_ms // (60 * 1000)
+    total_ms %= (60 * 1000)
+    sec = total_ms // 1000
+    ms  = total_ms % 1000
+
+    return f"{h:02d}:{m:02d}:{sec:02d}.{ms:03d}"
+
+def write_vtt_cues(subtitle_cues: list[dict], output_path: str) -> None:
+    """Write subtitle cues to a WebVTT file, deduplicating identical cues."""
+
+    lines = ["WEBVTT", ""]
+
+    prev_start = fmt_time(-1.0)
+    prev_end = fmt_time(-1.0)
+    for cue in subtitle_cues:
+        start = fmt_time(cue["start"])
+        end = fmt_time(cue["end"])
+        
+        # attempt to deduplicate the cue list
+        if prev_start == start and prev_end == end:
+            continue
+        prev_start = start
+        prev_end = end
+        text = cue.get("text", "").strip()
+
+        if not text:
+            continue
+
+        lines.append(f"{start} --> {end}")
+        lines.append(text)
+        lines.append("")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def write_json_output(result: dict, model: str, output_path: str) -> None:
+    """Write a complete JSON transcription with words nested inside each segment."""
+    output = dict()
+    output["duration"] = result["duration"]
+    output["text"] = result["text"] # the entire bulk transcription
+    output["segments"] = result["segments"]
+    output["model"] = model
+    if "language" in result and result["language"]:
+        output["language"] = result["language"]
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+
+
+def get_duration(input_filename,ffprobe_path=None):
+    """Get audio/video file duration in seconds using ffprobe."""
+    mime_type_result = mimetypes.guess_type(input_filename)
+    if not mime_type_result or not mime_type_result[0]:
+        raise RuntimeError(f"Could not determine mime type for '{input_filename}'")
+    mime, subtype = mime_type_result[0].split('/')
+    if mime != 'video' and mime != 'audio':
+        raise RuntimeError(f"Unsupported mime type '{mime}/{subtype}' for input file '{input_filename}'")
+    ffprobe_exe = os.path.join(ffprobe_path, 'ffprobe') if ffprobe_path else 'ffprobe'
+    try:
+        # https://superuser.com/questions/650291/how-to-get-video-duration-in-seconds
+        result = subprocess.run([ffprobe_exe,"-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", input_filename], stdout=subprocess.PIPE, text=True)
+        duration_seconds = float(result.stdout)
+        return duration_seconds
+    except FileNotFoundError as e:
+        print(e)
+        print("Warning: Couldn't execute ffprobe, defaulting to fixed timeout")
+    return 43200.0
+
+
+def find_openasr_binary(override_path=None):
+    """Locate the openasr executable in common paths."""
+    binary_name = "openasr.exe" if platform.system() == 'Windows' else "openasr"
+    if override_path:
+        if os.path.isfile(override_path) and os.access(override_path, os.X_OK): # Direct path specified
+            return os.path.realpath(override_path)
+        # Try finding the executable in the same directory as the specified path
+        test_path = os.path.join(override_path, binary_name)
+        if os.path.isfile(test_path) and os.access(test_path, os.X_OK):
+            return os.path.realpath(test_path)
+        raise FileNotFoundError(f"openasr binary not found at specified path: {override_path}")
+    path = shutil.which('openasr')
+    if path and os.path.isfile(path) and os.access(path, os.X_OK):
+        return os.path.realpath(path)
+    # Search for executable in directories sibling to this script that start with 'openasr'
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        for entry in os.listdir(script_dir):
+            full_entry = os.path.join(script_dir, entry)
+            if os.path.isdir(full_entry) and entry.startswith('openasr'):
+                candidate = os.path.join(full_entry, binary_name)
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return os.path.realpath(candidate)
+    except Exception:
+        pass
+    raise FileNotFoundError("openasr binary not found. Download the latest release from https://github.com/QuintinShaw/openasr/releases/")
+
+
+def is_server_ready(addr: str, timeout: int = 10) -> bool:
+    """Check if OpenASR server health endpoint is responsive."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            url = f"http://{addr}/health"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def start_openasr_server(model: str, addr: str = "127.0.0.1:8080", verbose: bool = False, openasr_path=None):
+    """Start OpenASR server process and wait until ready."""
+    openasr_bin = find_openasr_binary(override_path=openasr_path)
+    if verbose:
+        print(f"\nopenasr path found at '{openasr_bin}'")
+    cmd = [
+        openasr_bin,
+        'serve',
+        '--addr', addr,
+        '--backend', 'native',
+        '--model', model,
+    ]
+    env = os.environ.copy()
+    
+    if verbose:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=sys.stderr,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            bufsize=1,
+        )
+    else:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env,
+        )
+    
+    # Wait for health endpoint to be responsive
+    if not is_server_ready(addr):
+        proc.terminate()
+        raise RuntimeError("OpenASR server failed to start within 30 seconds")
+    
+    return proc
+
+
+def stop_openasr_server(proc: subprocess.Popen):
+    """Terminate and cleanup OpenASR server process."""
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    
+    parser = argparse.ArgumentParser(prog='transcribe', description='Transcribes audio using OpenASR.')
+
+    parser.add_argument('--ffprobe-path', type=str, default=None, help='Path to ffprobe. If not specified, it is presumed that ffprobe is in your PATH.')
+    parser.add_argument('--model', type=str, default='qwen3-asr-1.7b', choices=['qwen3-asr-0.6b', 'qwen3-asr-1.7b'], help='Run through all calculations but do not render the video.')
+    parser.add_argument('--openasr-path', type=str, default=None, help='Path to openasr binary. If not specified, will search PATH for openasr command (resolves aliases via shutil.which) or fail.')
+    parser.add_argument('--port', type=int, default=8080, help='Port to run OpenASR server on')
+    parser.add_argument('--timeout-multiplier',type=float, default=0.25, help='Multiply the audio duration by this value to determine the http request timeout. Value < 1 means it is expected to complete faster than real time.')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Print OpenASR server output')
+    
+    args, unknown_args = parser.parse_known_args()
+    
+    if len(unknown_args) == 0:
+        parser.print_help()
+        sys.exit(0)
+    
+    server_proc = None
+    try:
+        if args.verbose:
+            print("Starting OpenASR server...", end="") 
+        addr = f"127.0.0.1:{args.port}"
+        server_proc = start_openasr_server(args.model, addr=addr, verbose=args.verbose, openasr_path=args.openasr_path)
+        if args.verbose:
+            print(" done.")
+        
+        available_models = fetch_models(base_url=f"http://127.0.0.1:{args.port}/v1")
+        if args.verbose:
+            print(f"Available models: {available_models}")
+
+        if args.model not in available_models:
+            raise RuntimeError(
+                f"The selected model '{args.model}' isn't available, please install with "
+                f"'openasr pull {args.model}'\n"
+            )
+        
+        # Reject unknown arguments to avoid confusion or typos
+        for arg in unknown_args:
+            if not os.path.isfile(arg):
+                raise RuntimeError(f"Unknown argument '{arg}'")
+
+        # Presumably the other unknown arguments are input files to process
+        for arg in unknown_args:
+            filename = arg
+            mime_type, _ = mimetypes.guess_type(filename)
+            
+            # Need to determine a timeout for the transcription request
+            # Assuming the transcription happens faster than real-time, we can base
+            # the worst case on the total file duration and a constant factor (like 4x).
+            # This may have to be adjusted depending on the platform and transcription model.
+            duration = get_duration(filename)
+            client_timeout = max(1.0, duration * args.timeout_multiplier + 10.0) # Add a fixed duration buffer
+            if args.verbose:
+                print(f"Client timeout is {client_timeout} seconds")
+            
+            # Note: For qwen3-asr models (0.6b and 1.7b), the qwen3-forcedaligner-0.6b runs
+            # if the specified granularity is "word_aligned".
+            word_granularity = "word_aligned" if "qwen3-asr" in args.model else "word"
+            stem = os.path.splitext(os.path.basename(filename))[0]
+            
+            if args.verbose:
+                print(f"{mime_type} {filename}")
+            else:
+                print(filename)
+
+            session_id = str(uuid.uuid4())
+
+            stop_event = threading.Event()
+            t = threading.Thread(
+                target=poll_progress,
+                args=(session_id, stop_event, args.port),
+                daemon=True,
+            )
+            t.start()
+
+            with open(filename, "rb") as f:
+                file_bytes = f.read()
+
+            fields = {
+                "model": args.model,
+                "response_format": "verbose_json",
+                "timestamp_granularities[]": ["segment", word_granularity],
+                "transcription_id": session_id,
+            }
+            body, content_type = _encode_multipart(fields, ("file", (filename, file_bytes, mime_type)))
+
+            url = f"http://127.0.0.1:{args.port}/v1/audio/transcriptions"
+            req = urllib.request.Request(url, data=body, method="POST")
+            req.add_header("Content-Type", content_type)
+            max_retries = 3
+            attempt = 0
+            last_error = None
+            while True:
+                try:
+                    with urllib.request.urlopen(req, timeout=client_timeout) as resp:
+                        status = resp.status
+                        result_bytes = resp.read()
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 and attempt < max_retries - 1:
+                        attempt += 1
+                        if args.verbose:
+                            error_body = e.read()
+                            try:
+                                err_obj = json.loads(error_body.decode())
+                                error_msg = err_obj.get("error", {}).get("message", str(e))
+                            except Exception:
+                                error_msg = error_body.decode(errors="ignore")
+                            print(f"429 Too Many Requests, retrying {attempt}/{max_retries - 1}...", file=sys.stderr)
+                        time.sleep(0.5 * attempt)
+                        continue
+                    error_body = e.read()
+                    try:
+                        err_obj = json.loads(error_body.decode())
+                        error = err_obj.get("error", {})
+                    except Exception:
+                        error = {"message": error_body.decode(errors="ignore")}
+                    raise RuntimeError(f"Transcription failed: {error}")
+
+            stop_event.set()
+            try:
+                t.join(timeout=1.0)
+            except KeyboardInterrupt:
+                pass
+
+            print()
+            result = json.loads(result_bytes)
+            segments = result.get("segments", [])
+
+            if not segments:
+                print("No segments found in response.")
+                continue
+            words = result.get("words", [])
+
+            lang = "." + result["language"] if "language" in result else ""
+            output_vtt = os.path.join(
+                os.path.dirname(filename) or ".", f"{stem}{lang}.vtt"
+            )
+            write_vtt_cues(result['subtitle_cues'], output_vtt)
+            print(f"Wrote {output_vtt}")
+
+            output_json = os.path.join(
+                os.path.dirname(filename) or ".", f"{stem}.json"
+            )
+            write_json_output(result, args.model, output_json)
+            print(f"Wrote {output_json}")
+    finally:
+        if server_proc is not None:
+            if args.verbose:
+                print("Stopping OpenASR server...", end="")
+            stop_openasr_server(server_proc)
+            if args.verbose:
+                print(" done.")
