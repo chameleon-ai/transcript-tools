@@ -15,6 +15,76 @@ import urllib.request
 import urllib.parse
 import uuid
 
+LANGUAGE_NAME_TO_ISO = {
+    'afrikaans': 'af',
+    'arabic': 'ar',
+    'armenian': 'hy',
+    'azerbaijani': 'az',
+    'belarusian': 'be',
+    'bosnian': 'bs',
+    'bulgarian': 'bg',
+    'catalan': 'ca',
+    'chinese': 'zh',
+    'cantonese': 'yue',
+    'croatian': 'hr',
+    'czech': 'cs',
+    'danish': 'da',
+    'dutch': 'nl',
+    'english': 'en',
+    'estonian': 'et',
+    'finnish': 'fi',
+    'french': 'fr',
+    'galician': 'gl',
+    'german': 'de',
+    'greek': 'el',
+    'hebrew': 'he',
+    'hindi': 'hi',
+    'hungarian': 'hu',
+    'icelandic': 'is',
+    'indonesian': 'id',
+    'italian': 'it',
+    'japanese': 'ja',
+    'kannada': 'kn',
+    'kazakh': 'kk',
+    'korean': 'ko',
+    'latvian': 'lv',
+    'lithuanian': 'lt',
+    'macedonian': 'mk',
+    'malay': 'ms',
+    'maori': 'mi',
+    'marathi': 'mr',
+    'nepali': 'ne',
+    'norwegian': 'no',
+    'persian': 'fa',
+    'polish': 'pl',
+    'portuguese': 'pt',
+    'romanian': 'ro',
+    'russian': 'ru',
+    'serbian': 'sr',
+    'slovak': 'sk',
+    'slovenian': 'sl',
+    'spanish': 'es',
+    'swahili': 'sw',
+    'swedish': 'sv',
+    'tagalog': 'tl',
+    'filipino': 'tl',
+    'tamil': 'ta',
+    'thai': 'th',
+    'turkish': 'tr',
+    'ukrainian': 'uk',
+    'urdu': 'ur',
+    'vietnamese': 'vi',
+    'welsh': 'cy',
+}
+
+def _language_to_iso(lang):
+    if not lang:
+        return None
+    s = str(lang).strip().lower()
+    if len(s) == 2 and s.isalpha():
+        return s
+    return LANGUAGE_NAME_TO_ISO.get(s)
+
 def fetch_models(base_url: str = "http://127.0.0.1:8080/v1") -> list[str]:
     """Fetch available model IDs from the OpenASR server."""
     url = f"{base_url}/models"
@@ -150,7 +220,9 @@ def write_json_output(result: dict, model: str, output_path: str) -> None:
     output["segments"] = result["segments"]
     output["model"] = model
     if "language" in result and result["language"]:
-        output["language"] = result["language"]
+        iso = _language_to_iso(result["language"])
+        if iso:
+            output["language"] = iso
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
@@ -276,9 +348,11 @@ def stop_openasr_server(proc: subprocess.Popen):
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(prog='transcribe', description='Transcribes audio using OpenASR.')
+    
+    model_list = [ 'cohere-transcribe-03-2026', 'firered-aed-l-v2', 'firered2-llm', 'mimo-v2.5-asr', 'moonshine-tiny', 'moss-transcribe-diarize', 'qwen3-asr-0.6b', 'qwen3-asr-1.7b', 'whisper-large-v3-turbo' ]
 
     parser.add_argument('--ffprobe-path', type=str, default=None, help='Path to ffprobe. If not specified, it is presumed that ffprobe is in your PATH.')
-    parser.add_argument('--model', type=str, default='qwen3-asr-1.7b', choices=['qwen3-asr-0.6b', 'qwen3-asr-1.7b'], help='Run through all calculations but do not render the video.')
+    parser.add_argument('-m', '--model', type=str, default='whisper-large-v3-turbo', choices=model_list, help='Run through all calculations but do not render the video.')
     parser.add_argument('--openasr-path', type=str, default=None, help='Path to openasr binary. If not specified, will search PATH for openasr command (resolves aliases via shutil.which) or fail.')
     parser.add_argument('--port', type=int, default=8080, help='Port to run OpenASR server on')
     parser.add_argument('--timeout-multiplier',type=float, default=0.25, help='Multiply the audio duration by this value to determine the http request timeout. Value < 1 means it is expected to complete faster than real time.')
@@ -304,10 +378,19 @@ if __name__ == "__main__":
             print(f"Available models: {available_models}")
 
         if args.model not in available_models:
-            raise RuntimeError(
-                f"The selected model '{args.model}' isn't available, please install with "
-                f"'openasr pull {args.model}'\n"
-            )
+            # search for model substring in case it's not an exact match
+            # this is mostly a workaround for mimo-v2.5-asr where it reports as 'mimo-v2.5-asr-q4k'
+            found = False
+            for model in available_models: 
+                if args.model in model:
+                    found = True
+                    args.model = model
+                    break
+            if not found:
+                raise RuntimeError(
+                    f"The selected model '{args.model}' isn't available, please install with "
+                    f"'openasr pull {args.model}'\n"
+                )
         
         # Reject unknown arguments to avoid confusion or typos
         for arg in unknown_args:
@@ -407,9 +490,10 @@ if __name__ == "__main__":
                 continue
             words = result.get("words", [])
 
-            lang = "." + result["language"] if "language" in result else ""
+            lang_iso = _language_to_iso(result.get("language")) if "language" in result else None
+            lang_suffix = f".{lang_iso}" if lang_iso else ""
             output_vtt = os.path.join(
-                os.path.dirname(filename) or ".", f"{stem}{lang}.vtt"
+                os.path.dirname(filename) or ".", f"{stem}{lang_suffix}.vtt"
             )
             write_vtt_cues(result['subtitle_cues'], output_vtt)
             print(f"Wrote {output_vtt}")

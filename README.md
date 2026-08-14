@@ -29,7 +29,16 @@ python transcribe.py [-v] <file>...
 
 Options:
 - `--ffprobe-path PATH` - path to ffprobe directory
-- `--model` - model to use, default `qwen3-asr-1.7b`
+- `--model` - model to use, default `whisper-large-v3-turbo`. Tested models:
+  - [cohere-transcribe-03-2026](https://huggingface.co/OpenASR/cohere-transcribe-03-2026)
+  - [firered-aed-l-v2](https://huggingface.co/OpenASR/firered-aed-l-v2)
+  - [firered2-llm](https://huggingface.co/OpenASR/firered2-llm)
+  - [mimo-v2.5-asr](https://huggingface.co/OpenASR/mimo-v2.5-asr)
+  - [moonshine-tiny](https://huggingface.co/OpenASR/moonshine-tiny)
+  - [moss-transcribe-diarize](https://huggingface.co/OpenASR/moss-transcribe-diarize)
+  - [qwen3-asr-0.6b](https://huggingface.co/OpenASR/qwen3-asr-0.6b)
+  - [qwen3-asr-1.7b](https://huggingface.co/OpenASR/qwen3-asr-1.7b)
+  - [whisper-large-v3-turbo](https://huggingface.co/OpenASR/whisper-large-v3-turbo) 
 - `--openasr-path PATH` - path to openasr directory
 - `--port INT` - default 8080
 - `--timeout-multiplier FLOAT` - default 0.25. Multiply the audio duration by this value to determine the http request timeout. Value < 1 means it is expected to complete faster than real time, which is usually the case unless the machine is underpowered and doing something like CPU inference.
