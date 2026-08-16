@@ -8,6 +8,7 @@ import random
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -351,8 +352,9 @@ if __name__ == "__main__":
     
     model_list = [ 'cohere-transcribe-03-2026', 'firered-aed-l-v2', 'firered2-llm', 'mimo-v2.5-asr', 'moonshine-tiny', 'moss-transcribe-diarize', 'qwen3-asr-0.6b', 'qwen3-asr-1.7b', 'whisper-large-v3-turbo' ]
 
+    parser.add_argument('--ffmpeg-path', type=str, default=None, help='Path to ffmpeg. If not specified, it is presumed that ffmpeg is in your PATH.')
     parser.add_argument('--ffprobe-path', type=str, default=None, help='Path to ffprobe. If not specified, it is presumed that ffprobe is in your PATH.')
-    parser.add_argument('-m', '--model', type=str, default='whisper-large-v3-turbo', choices=model_list, help='Run through all calculations but do not render the video.')
+    parser.add_argument('-m', '--model', type=str, default='cohere-transcribe-03-2026', choices=model_list, help='Run through all calculations but do not render the video.')
     parser.add_argument('--openasr-path', type=str, default=None, help='Path to openasr binary. If not specified, will search PATH for openasr command (resolves aliases via shutil.which) or fail.')
     parser.add_argument('--port', type=int, default=8080, help='Port to run OpenASR server on')
     parser.add_argument('--timeout-multiplier',type=float, default=0.25, help='Multiply the audio duration by this value to determine the http request timeout. Value < 1 means it is expected to complete faster than real time.')
@@ -365,6 +367,7 @@ if __name__ == "__main__":
         sys.exit(0)
     
     server_proc = None
+    temp_audio = None
     try:
         if args.verbose:
             print("Starting OpenASR server...", end="") 
@@ -399,27 +402,93 @@ if __name__ == "__main__":
 
         # Presumably the other unknown arguments are input files to process
         for arg in unknown_args:
+            source_path = arg
             filename = arg
             mime_type, _ = mimetypes.guess_type(filename)
-            
+
             # Need to determine a timeout for the transcription request
             # Assuming the transcription happens faster than real-time, we can base
             # the worst case on the total file duration and a constant factor (like 4x).
             # This may have to be adjusted depending on the platform and transcription model.
-            duration = get_duration(filename)
+            duration = get_duration(filename, ffprobe_path=args.ffprobe_path)
             client_timeout = max(1.0, duration * args.timeout_multiplier + 10.0) # Add a fixed duration buffer
             if args.verbose:
                 print(f"Client timeout is {client_timeout} seconds")
-            
+
             # Note: For qwen3-asr models (0.6b and 1.7b), the qwen3-forcedaligner-0.6b runs
             # if the specified granularity is "word_aligned".
             word_granularity = "word_aligned" if "qwen3-asr" in args.model else "word"
             stem = os.path.splitext(os.path.basename(filename))[0]
-            
+
             if args.verbose:
                 print(f"{mime_type} {filename}")
             else:
                 print(filename)
+
+            # The OpenASR native backend only prepares recognized audio extensions
+            # (wav, mp3, mp4, m4a, m4b, mov, webm, flac, ogg, opus, aac, ...).
+            # Unrecognized video containers (mkv, avi, ts, ...) are rejected, so we
+            # extract the audio stream by remuxing it into a container whose
+            # extension the server recognizes (audio copy, no re-encoding).
+            audio_ext = os.path.splitext(filename)[1].lower()
+            recognized = {'.wav', '.mp3', '.mp4', '.m4a', '.m4b', '.mov', '.webm',
+                          '.flac', '.ogg', '.opus', '.aif', '.aiff', '.caf', '.wma', '.amr'}
+            if mime_type and not (mime_type.startswith("audio/") and audio_ext in recognized):
+                if not shutil.which("ffmpeg") and not args.ffmpeg_path:
+                    raise RuntimeError(
+                        "Cannot process this input: ffmpeg is required to extract the audio stream. "
+                        "Install ffmpeg or add its location with --ffmpeg-path."
+                    )
+                ffprobe_exe = os.path.join(args.ffprobe_path, "ffprobe") if args.ffprobe_path else "ffprobe"
+                stream_probe = subprocess.run(
+                    [ffprobe_exe, "-v", "error", "-select_streams", "a:0",
+                     "-show_entries", "stream=codec_name",
+                     "-of", "default=noprint_wrappers=1:nokey=1", filename],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                codec = stream_probe.stdout.strip().splitlines()[0] if stream_probe.stdout.strip() else ""
+                # map audio codec -> container extension the server recognizes
+                copy_ext = {
+                    'aac': '.m4a',
+                    'mp3': '.mp3',
+                    'vorbis': '.ogg',
+                    'opus': '.opus',
+                    'flac': '.flac',
+                    'pcm_s16le': '.wav',
+                    'pcm_f32le': '.wav',
+                }.get(codec)
+                stem, _ = os.path.splitext(os.path.basename(filename))
+                tempdir = tempfile.mkdtemp(prefix="transcribe_")
+                temp_audio = os.path.join(tempdir, stem + (copy_ext or ".wav"))
+                ffmpeg_exe = os.path.join(args.ffmpeg_path, "ffmpeg") if args.ffmpeg_path else "ffmpeg"
+                if args.verbose:
+                    print(f"Extracting audio from {filename} to {temp_audio} (codec: {codec or 'unknown'})")
+                if copy_ext:
+                    extract_cmd = [ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-i", filename,
+                                   "-map", "0:a:0", "-c:a", "copy", temp_audio]
+                else:
+                    # unknown codec: transcode instead of copy
+                    extract_cmd = [ffmpeg_exe, "-hide_banner", "-loglevel", "error", "-i", filename,
+                                   "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", temp_audio]
+                extract = subprocess.run(
+                    extract_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if extract.returncode != 0:
+                    os.unlink(temp_audio)
+                    shutil.rmtree(tempdir, ignore_errors=True)
+                    raise RuntimeError(
+                        f"ffmpeg failed to extract audio from {filename}: {extract.stderr.strip()}"
+                    )
+                mime_type, _ = mimetypes.guess_type(temp_audio)
+                filename = temp_audio
+                output_dir = os.path.dirname(source_path) or "."
+            else:
+                output_dir = os.path.dirname(filename) or "."
 
             session_id = str(uuid.uuid4())
 
@@ -440,12 +509,14 @@ if __name__ == "__main__":
                 "timestamp_granularities[]": ["segment", word_granularity],
                 "transcription_id": session_id,
             }
+            if args.verbose:
+                print(fields)
             body, content_type = _encode_multipart(fields, ("file", (filename, file_bytes, mime_type)))
 
             url = f"http://127.0.0.1:{args.port}/v1/audio/transcriptions"
             req = urllib.request.Request(url, data=body, method="POST")
             req.add_header("Content-Type", content_type)
-            max_retries = 3
+            max_retries = 6
             attempt = 0
             last_error = None
             while True:
@@ -487,23 +558,32 @@ if __name__ == "__main__":
 
             if not segments:
                 print("No segments found in response.")
+                if temp_audio is not None and os.path.exists(temp_audio):
+                    os.unlink(temp_audio)
+                    shutil.rmtree(os.path.dirname(temp_audio), ignore_errors=True)
+                    temp_audio = None
                 continue
             words = result.get("words", [])
 
             lang_iso = _language_to_iso(result.get("language")) if "language" in result else None
             lang_suffix = f".{lang_iso}" if lang_iso else ""
-            output_vtt = os.path.join(
-                os.path.dirname(filename) or ".", f"{stem}{lang_suffix}.vtt"
-            )
+            output_vtt = os.path.join(output_dir, f"{stem}{lang_suffix}.vtt")
             write_vtt_cues(result['subtitle_cues'], output_vtt)
             print(f"Wrote {output_vtt}")
 
-            output_json = os.path.join(
-                os.path.dirname(filename) or ".", f"{stem}.json"
-            )
+            output_json = os.path.join(output_dir, f"{stem}.json")
             write_json_output(result, args.model, output_json)
             print(f"Wrote {output_json}")
+
+            # Clean up the extracted temp audio file
+            if temp_audio is not None and os.path.exists(temp_audio):
+                os.unlink(temp_audio)
+                shutil.rmtree(os.path.dirname(temp_audio), ignore_errors=True)
+                temp_audio = None
     finally:
+        if temp_audio is not None and os.path.exists(temp_audio):
+            os.unlink(temp_audio)
+            shutil.rmtree(os.path.dirname(temp_audio), ignore_errors=True)
         if server_proc is not None:
             if args.verbose:
                 print("Stopping OpenASR server...", end="")

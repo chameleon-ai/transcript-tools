@@ -4,7 +4,7 @@ Simple transcription tools leveraging [OpenASR](https://github.com/QuintinShaw/o
 
 OpenASR is usable by itself, but for convenience, I've developed a thin wrapper that does exactly what I need it to do: make .vtt and .json transcripts. With an alias to the `transcribe.py` script, all I need to do in the command-line is type `transcribe input.mp4` and out pops the transcript files.
 
-Developed on linux with python 3.14. Probably works on Windows. Developed with the assistance of [opencode](https://opencode.ai/) using [Qwen3.6](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) and [Muse Glimmer](https://huggingface.co/meta-models/Muse-Glimmer-30B).
+Developed on linux with python 3.14. Probably works on Windows. Developed with the assistance of [opencode](https://opencode.ai/) using [Qwen3.8](https://huggingface.co/Qwen/Qwen3.8-27B) and [Muse Glimmer](https://huggingface.co/meta-models/Muse-Glimmer-30B).
 
 ## Description
 
@@ -28,8 +28,9 @@ python transcribe.py [-v] <file>...
 ```
 
 Options:
+- `--ffmpeg-path PATH` - path to ffmpeg directory
 - `--ffprobe-path PATH` - path to ffprobe directory
-- `--model` - model to use, default `whisper-large-v3-turbo`. Tested models:
+- `-m/--model` - model to use, default `cohere-transcribe-03-2026`. Tested models:
   - [cohere-transcribe-03-2026](https://huggingface.co/OpenASR/cohere-transcribe-03-2026)
   - [firered-aed-l-v2](https://huggingface.co/OpenASR/firered-aed-l-v2)
   - [firered2-llm](https://huggingface.co/OpenASR/firered2-llm)
