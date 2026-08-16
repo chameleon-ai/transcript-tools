@@ -172,6 +172,18 @@ def poll_progress(
         time.sleep(1.0)
 
 
+def _unique_path(path: str) -> str:
+    """Return a non-colliding path by inserting .1, .2, ... before the extension."""
+    directory, name = os.path.split(path)
+    stem, ext = os.path.splitext(name)
+    if os.path.exists(path):
+        for n in range(1, 1000):
+            candidate = os.path.join(directory, f"{stem}.{n}{ext}")
+            if not os.path.exists(candidate):
+                return candidate
+    return path
+
+
 def fmt_time(s: float) -> str:
     """Format time in seconds to WebVTT time format HH:MM:SS.mmm."""
     total_ms = int(round(s * 1000))
@@ -567,11 +579,11 @@ if __name__ == "__main__":
 
             lang_iso = _language_to_iso(result.get("language")) if "language" in result else None
             lang_suffix = f".{lang_iso}" if lang_iso else ""
-            output_vtt = os.path.join(output_dir, f"{stem}{lang_suffix}.vtt")
+            output_vtt = _unique_path(os.path.join(output_dir, f"{stem}{lang_suffix}.vtt"))
             write_vtt_cues(result['subtitle_cues'], output_vtt)
             print(f"Wrote {output_vtt}")
 
-            output_json = os.path.join(output_dir, f"{stem}.json")
+            output_json = _unique_path(os.path.join(output_dir, f"{stem}.json"))
             write_json_output(result, args.model, output_json)
             print(f"Wrote {output_json}")
 
