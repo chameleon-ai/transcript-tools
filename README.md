@@ -17,7 +17,7 @@ Developed on linux with python 3.14. Probably works on Windows. Developed with t
 
 - `transcribe.py`:
   - Only uses the python standard library. No virtual environment setup is necessary.
-  - Depends on [OpenASR](https://github.com/QuintinShaw/openasr). Build it from source or download the [latest release](https://github.com/QuintinShaw/openasr/releases/) and place the `openasr` directory alongside `transcribe.py`. The script will attempt to find the `openasr` executable automatically, but the path may be manually specified with `--openasr-path`
+  - Depends on [OpenASR](https://github.com/QuintinShaw/openasr). On Linux, if you have the proper build dependencies installed, run `setup.sh` and it will clone and build openasr from source. Alternatively, download the [latest release](https://github.com/QuintinShaw/openasr/releases/) and place the `openasr` directory alongside `transcribe.py`. The script will attempt to find the `openasr` executable automatically, but the path may be manually specified with `--openasr-path`
   - You must manually install openasr models before use: `openasr pull <model>`
   - There is a soft dependency on [ffprobe](https://ffmpeg.org/ffprobe.html) to determine the max timeout of the transcription request based on the input duration. Make sure `ffprobe` is in PATH or manually specify via `--ffprobe-path`. If missing, a long duration is used as a fallback.
 
