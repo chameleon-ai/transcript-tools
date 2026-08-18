@@ -284,6 +284,10 @@ def find_openasr_binary(override_path=None):
                 candidate = os.path.join(full_entry, binary_name)
                 if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                     return os.path.realpath(candidate)
+                # Manual repo clone and build places the executable here
+                candidate = os.path.join(full_entry, "target", "release", binary_name)
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return os.path.realpath(candidate)
     except Exception:
         pass
     raise FileNotFoundError("openasr binary not found. Download the latest release from https://github.com/QuintinShaw/openasr/releases/")
@@ -371,6 +375,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=8080, help='Port to run OpenASR server on')
     parser.add_argument('--timeout-multiplier',type=float, default=0.25, help='Multiply the audio duration by this value to determine the http request timeout. Value < 1 means it is expected to complete faster than real time.')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print OpenASR server output')
+    parser.add_argument('--vtt-only', action='store_true', help='Only output .vtt file, skip .json')
     
     args, unknown_args = parser.parse_known_args()
     
@@ -583,9 +588,10 @@ if __name__ == "__main__":
             write_vtt_cues(result['subtitle_cues'], output_vtt)
             print(f"Wrote {output_vtt}")
 
-            output_json = _unique_path(os.path.join(output_dir, f"{stem}.json"))
-            write_json_output(result, args.model, output_json)
-            print(f"Wrote {output_json}")
+            if not args.vtt_only:
+                output_json = _unique_path(os.path.join(output_dir, f"{stem}.json"))
+                write_json_output(result, args.model, output_json)
+                print(f"Wrote {output_json}")
 
             # Clean up the extracted temp audio file
             if temp_audio is not None and os.path.exists(temp_audio):
