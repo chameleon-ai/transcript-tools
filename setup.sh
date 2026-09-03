@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO_URL=${OPENASR_REPO:-https://github.com/QuintinShaw/openasr.git}
+REPO_URL=${OPENASR_REPO:-https://github.com/chameleon-ai//openasr.git}
 DIR=${OPENASR_DIR:-openasr}
 
 if [ ! -d "$DIR/.git" ]; then

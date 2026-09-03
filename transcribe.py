@@ -370,17 +370,22 @@ if __name__ == "__main__":
 
     parser.add_argument('--ffmpeg-path', type=str, default=None, help='Path to ffmpeg. If not specified, it is presumed that ffmpeg is in your PATH.')
     parser.add_argument('--ffprobe-path', type=str, default=None, help='Path to ffprobe. If not specified, it is presumed that ffprobe is in your PATH.')
-    parser.add_argument('-m', '--model', type=str, default='cohere-transcribe-03-2026', choices=model_list, help='Run through all calculations but do not render the video.')
+    parser.add_argument('-m', '--model', type=str, default='qwen3-asr-1.7b', choices=model_list, help='Run through all calculations but do not render the video.')
     parser.add_argument('--openasr-path', type=str, default=None, help='Path to openasr binary. If not specified, will search PATH for openasr command (resolves aliases via shutil.which) or fail.')
     parser.add_argument('--port', type=int, default=8080, help='Port to run OpenASR server on')
     parser.add_argument('--timeout-multiplier',type=float, default=0.25, help='Multiply the audio duration by this value to determine the http request timeout. Value < 1 means it is expected to complete faster than real time.')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print OpenASR server output')
     parser.add_argument('--vtt-only', action='store_true', help='Only output .vtt file, skip .json')
+    parser.add_argument('--json-only', action='store_true', help='Only output .json file, skip .vtt')
     
     args, unknown_args = parser.parse_known_args()
     
     if len(unknown_args) == 0:
         parser.print_help()
+        sys.exit(0)
+    
+    if args.vtt_only and args.json_only:
+        print('--vtt-only and --json-only are mutually exclusive flags')
         sys.exit(0)
     
     server_proc = None
@@ -543,7 +548,7 @@ if __name__ == "__main__":
                         result_bytes = resp.read()
                     break
                 except urllib.error.HTTPError as e:
-                    if e.code == 429 and attempt < max_retries - 1:
+                    if (e.code == 429 or e.code == 409) and attempt < max_retries - 1:
                         attempt += 1
                         if args.verbose:
                             error_body = e.read()
@@ -582,11 +587,12 @@ if __name__ == "__main__":
                 continue
             words = result.get("words", [])
 
-            lang_iso = _language_to_iso(result.get("language")) if "language" in result else None
-            lang_suffix = f".{lang_iso}" if lang_iso else ""
-            output_vtt = _unique_path(os.path.join(output_dir, f"{stem}{lang_suffix}.vtt"))
-            write_vtt_cues(result['subtitle_cues'], output_vtt)
-            print(f"Wrote {output_vtt}")
+            if not args.json_only:
+                lang_iso = _language_to_iso(result.get("language")) if "language" in result else None
+                lang_suffix = f".{lang_iso}" if lang_iso else ""
+                output_vtt = _unique_path(os.path.join(output_dir, f"{stem}{lang_suffix}.vtt"))
+                write_vtt_cues(result['subtitle_cues'], output_vtt)
+                print(f"Wrote {output_vtt}")
 
             if not args.vtt_only:
                 output_json = _unique_path(os.path.join(output_dir, f"{stem}.json"))
