@@ -21,7 +21,7 @@ Required:
 - `ffprobe` in PATH or via `--ffprobe-path`; if missing duration defaults to 43200s.
 
 Outputs per input file `<stem>`:
-- `<stem><.lang>.vtt` — WebVTT cues, deduplicated.
+- `<stem><.lang>.vtt` — WebVTT cues, with short/adjacent cues compacted into fuller lines.
 - `<stem>.json` — verbose JSON with duration, text, segments, model, language.
 
 Other flags:
