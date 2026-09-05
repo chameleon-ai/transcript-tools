@@ -289,6 +289,21 @@ def _split_block(parts: list[dict], out: list[dict]) -> None:
     _split_block(parts[k:], out)
 
 
+def _deoverlap_lines(lines: list[dict]) -> None:
+    """Remove overlapping timestamps between consecutive lines.
+
+    ASR word spans overlap (a word's end can be later than the next word's
+    start), so a line's end can land inside the next line's. Where that
+    happens the overlap is replaced by its midpoint: the previous line's end
+    and the next line's start both become (prev_end + next_start) / 2.
+    """
+    for prev, curr in zip(lines, lines[1:]):
+        if curr["start"] < prev["end"]:
+            mid = (prev["end"] + curr["start"]) / 2
+            prev["end"] = mid
+            curr["start"] = mid
+
+
 def build_vtt_words(segments: list[dict]) -> list[dict]:
     """Build VTT lines from word-level timings.
 
@@ -342,6 +357,7 @@ def build_vtt_words(segments: list[dict]) -> list[dict]:
             parts.append({**word, "gap": 0.0})
 
     flush()
+    _deoverlap_lines(lines)
     return lines
 
 
