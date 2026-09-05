@@ -1,8 +1,8 @@
 # transcript-tools
 
-Simple transcription tools leveraging [OpenASR](https://github.com/QuintinShaw/openasr), which was chosen as a backend due to its wide-ranging support for state-of-the-art models. My previous tools leveraged [whisper](https://github.com/linto-ai/whisper-timestamped) which is good but locked into a model family that [hasn't been updated in years](https://huggingface.co/openai/whisper-large-v3-turbo). With new transcription models coming out all the time, OpenASR looks to be the most promising solution that unifies multiple architectures with potential support for future models.
+Simple transcription tools leveraging [OpenASR](https://github.com/QuintinShaw/openasr), which was chosen as a backend due to its wide-ranging support for state-of-the-art models. My previous tools leveraged [whisper](https://github.com/linto-ai/whisper-timestamped) which is good but locked into a model family that [hasn't been updated in years](https://huggingface.co/openai/whisper-large-v3-turbo). With new transcription models coming out all the time, OpenASR looks to be the most promising solution that unifies multiple architectures with potential support for future models. I've made [my own fork](https://github.com/chameleon-ai/openasr/tree/main) of OpenASR with the goal of obtaining more accurate timestamps. It's not necessary to use this fork, but I recommend it if you're using [qwen3-asr-1.7b](https://huggingface.co/OpenASR/qwen3-asr-1.7b), [whisper](https://huggingface.co/OpenASR/whisper-large-v3-turbo), or [cohere](https://huggingface.co/OpenASR/cohere-transcribe-03-2026), which I've specifically targeted for improvements.
 
-OpenASR is usable by itself, but for convenience, I've developed a thin wrapper that does exactly what I need it to do: make .vtt and .json transcripts. With an alias to the `transcribe.py` script, all I need to do in the command-line is type `transcribe input.mp4` and out pops the transcript files.
+OpenASR is usable by itself, but for convenience, I've developed a thin wrapper that does exactly what I need it to do: make .vtt and .json transcripts. I was dissatisfied with OpenASR's default .vtt outputs so the script has a custom post-processing step to assemble them using word-level timestamps. With an alias to the `transcribe.py` script, all I need to do in the command-line is type `transcribe input.mp4` and out pops the transcript files.
 
 Developed on linux with python 3.14. Probably works on Windows. Developed with the assistance of [opencode](https://opencode.ai/) using [Qwen3.8](https://huggingface.co/Qwen/Qwen3.8-27B) and [Muse Glimmer](https://huggingface.co/meta-models/Muse-Glimmer-30B).
 
@@ -20,6 +20,7 @@ Developed on linux with python 3.14. Probably works on Windows. Developed with t
   - Depends on [OpenASR](https://github.com/QuintinShaw/openasr). On Linux, if you have the proper build dependencies installed, run `setup.sh` and it will clone and build openasr from source. Alternatively, download the [latest release](https://github.com/QuintinShaw/openasr/releases/) and place the `openasr` directory alongside `transcribe.py`. The script will attempt to find the `openasr` executable automatically, but the path may be manually specified with `--openasr-path`
   - You must manually install openasr models before use: `openasr pull <model>`
   - There is a soft dependency on [ffprobe](https://ffmpeg.org/ffprobe.html) to determine the max timeout of the transcription request based on the input duration. Make sure `ffprobe` is in PATH or manually specify via `--ffprobe-path`. If missing, a long duration is used as a fallback.
+  - [ffmpeg](https://ffmpeg.org/download.html) is required for file types not natively supported by openasr. Used to extract or reformat audio.
 
 ## Usage
 
@@ -54,5 +55,5 @@ python transcribe.py -v --model qwen3-asr-0.6b video.mp4 audio.wav
 ```
 
 Outputs per input file `<stem>`:
-- `<stem><.lang>.vtt` — WebVTT cues, deduplicated
+- `<stem><.lang>.vtt` — WebVTT subtitles
 - `<stem>.json` — verbose JSON with duration, text, segments, model, language
