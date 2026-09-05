@@ -199,15 +199,52 @@ def fmt_time(s: float) -> str:
 
 SENTENCE_END_PUNCT = {'.', '!', '?'}
 
-# Target line quality (a line over either is split at its widest internal gap)
+# VTT lines are built from word-level timings (the subtitle_cues endpoint can
+# drop words, the word list never does). Target line quality: a block over
+# either MAX_DUR / MAX_CHARS is split at its widest internal word boundary.
 MIN_DUR = 2.0      # seconds; blocks under this are "fragments" that keep absorbing
 MAX_DUR = 4.5      # target max line duration
 MAX_CHARS = 88     # target max line length (~2 rendered lines of 42 chars)
-GAP_SOFT = 0.5     # max gap to extend a well-formed block
-GAP_SHORT = 2.5    # max gap a fragment block may bridge while it is still short
+GAP_SOFT = 0.5     # max word gap to extend a well-formed block
+GAP_SHORT = 2.5    # max word gap a fragment block may bridge while it is still short
 HARD_DUR = 6.5     # absolute cap a single block may reach
 HARD_CHARS = 110   # absolute char cap for a single block
 MIN_PIECE = 0.8    # seconds; never split a block into a shorter line
+
+
+def _segment_words(segment: dict) -> list[dict]:
+    """Return the segment's words with the segment text's punctuation attached.
+
+    subtitle_cues drops words, so subtitles are built from the word-level
+    timings instead. Word strings are bare ("book"), while the segment text
+    carries the punctuation ("book?"); the two are 1:1 aligned, so each word's
+    surrounding punctuation is re-attached to recover sentence-final markers
+    (".", "!", "?", "...", "??") for the sentence-break heuristics. Leading and
+    trailing punctuation are the non-alnum/non-apostrophe runs at each end of
+    the token, so contractions ("don't", "I'm") stay intact.
+    """
+    words = segment.get("words", [])
+    if not words:
+        return []
+    tokens = str(segment.get("text", "")).split()
+    att = []
+    for i, w in enumerate(words):
+        bare = str(w.get("word", " ")).strip() or " "
+        token = tokens[i].strip() if i < len(tokens) else bare
+        a, b = 0, len(token)
+        while a < b and not (token[a].isalnum() or token[a] == "'"):
+            a += 1
+        while b > a and not (token[b - 1].isalnum() or token[b - 1] == "'"):
+            b -= 1
+        core = token[a:b].lower()
+        if core == bare.lower():
+            prefix, suffix = token[:a], token[b:]
+        else:
+            # token/word out of alignment: keep the bare word so no text is lost
+            prefix, suffix = "", ""
+        att.append({"word": prefix + bare + suffix,
+                    "start": float(w["start"]), "end": float(w["end"])})
+    return att
 
 
 def _is_sentence_break(prev_text: str, next_text: str) -> bool:
@@ -220,14 +257,14 @@ def _split_block(parts: list[dict], out: list[dict]) -> None:
     """Emit the block as one or more lines, splitting at the most natural
     internal boundary whenever the block exceeds MAX_DUR / MAX_CHARS.
 
-    Candidates are the seams between cues whose split leaves at least
+    Candidates are the seams between words whose split leaves at least
     MIN_PIECE seconds on both sides. The best seam ends on sentence-final
     punctuation (. ! ?), then the widest gap, then the most balanced halves.
     The split is applied recursively (halves may themselves be too long).
     """
     start = parts[0]["start"]
     end = parts[-1]["end"]
-    text = " ".join(p["text"] for p in parts)
+    text = " ".join(p["word"] for p in parts)
 
     if end - start <= MAX_DUR and len(text) <= MAX_CHARS or len(parts) < 2:
         out.append({"start": start, "end": end, "text": text})
@@ -239,7 +276,7 @@ def _split_block(parts: list[dict], out: list[dict]) -> None:
         right_dur = end - parts[k]["start"]
         if left_dur < MIN_PIECE or right_dur < MIN_PIECE:
             continue
-        sentence_end = 1 if parts[k - 1]["text"].rstrip()[-1:] in SENTENCE_END_PUNCT else 0
+        sentence_end = 1 if parts[k - 1]["word"].rstrip()[-1:] in SENTENCE_END_PUNCT else 0
         candidates.append(
             (sentence_end, parts[k]["gap"], -abs(left_dur - right_dur), k)
         )
@@ -252,28 +289,25 @@ def _split_block(parts: list[dict], out: list[dict]) -> None:
     _split_block(parts[k:], out)
 
 
-def compact_vtt_cues(subtitle_cues: list[dict]) -> list[dict]:
-    """Compact ASR subtitle cues into fewer, more complete lines.
+def build_vtt_words(segments: list[dict]) -> list[dict]:
+    """Build VTT lines from word-level timings.
 
-    Phase 1 (merge): greedily grow a block from consecutive cues. A block may
-    absorb the next cue across a gap of GAP_SHORT when it is still shorter
-    than MIN_DUR (so 0.2s fragments like "I" / "You" and ASR stutters/restarts
-    get absorbed), or across GAP_SOFT once well-formed, up to the HARD caps.
-    A well-formed block that ends a sentence (. ! ?) flushes before a cue that
-    starts with a capital so complete sentences are not glued together.
+    Phase 1 (merge): greedily grow a block from consecutive words across all
+    segments (segment boundaries are not real speech boundaries). A block may
+    absorb the next word across a gap of GAP_SHORT when it is still shorter
+    than MIN_DUR, or across GAP_SOFT once well-formed, up to the HARD caps.
+    A well-formed block that ends a sentence (. ! ?) flushes before a word
+    that starts with a capital so complete sentences are not glued together.
 
     Phase 2 (split): any block longer than MAX_DUR or MAX_CHARS is split at
     its most natural internal seam (sentence-final punctuation preferred,
     then the widest timing gap, then the most balanced halves) recursively,
     as long as both resulting lines are at least MIN_PIECE seconds long.
-    Original cue timings are preserved (lines start/end at cue boundaries).
     """
-    cues = [
-        {"start": float(c["start"]), "end": float(c["end"]), "text": str(c.get("text", "")).strip()}
-        for c in subtitle_cues
-        if str(c.get("text", "")).strip()
-    ]
-    cues.sort(key=lambda c: c["start"])
+    words: list[dict] = []
+    for seg in segments:
+        words.extend(_segment_words(seg))
+    words.sort(key=lambda w: w["start"])
 
     lines: list[dict] = []
     parts: list[dict] = []
@@ -284,40 +318,37 @@ def compact_vtt_cues(subtitle_cues: list[dict]) -> list[dict]:
             _split_block(parts, lines)
             parts = []
 
-    for cue in cues:
+    for word in words:
         if not parts:
-            parts.append({**cue, "gap": 0.0})
+            parts.append({**word, "gap": 0.0})
             continue
 
-        # exact duplicate timestamps are ASR noise, not speech
-        if cue["start"] == parts[-1]["start"] and cue["end"] == parts[-1]["end"]:
-            continue
-
+        # silence gap: words overlap in ASR, so clamp to zero
+        gap = max(0.0, word["start"] - parts[-1]["end"])
         block_dur = parts[-1]["end"] - parts[0]["start"]
-        gap_before = cue["start"] - parts[-1]["end"]
-        acc_dur = cue["end"] - parts[0]["start"]
-        acc_text = " ".join(p["text"] for p in parts) + " " + cue["text"]
+        acc_dur = word["end"] - parts[0]["start"]
+        acc_text = " ".join(p["word"] for p in parts) + " " + word["word"]
 
-        if _is_sentence_break(parts[-1]["text"], cue["text"]) and block_dur >= MIN_DUR:
+        if _is_sentence_break(parts[-1]["word"], word["word"]) and block_dur >= MIN_DUR:
             flush()
-            parts.append({**cue, "gap": 0.0})
+            parts.append({**word, "gap": 0.0})
             continue
 
         max_gap = GAP_SHORT if block_dur < MIN_DUR else GAP_SOFT
-        if gap_before <= max_gap and acc_dur <= HARD_DUR and len(acc_text) <= HARD_CHARS:
-            parts.append({**cue, "gap": gap_before})
+        if gap <= max_gap and acc_dur <= HARD_DUR and len(acc_text) <= HARD_CHARS:
+            parts.append({**word, "gap": gap})
         else:
             flush()
-            parts.append({**cue, "gap": 0.0})
+            parts.append({**word, "gap": 0.0})
 
     flush()
     return lines
 
 
-def write_vtt_cues(subtitle_cues: list[dict], output_path: str) -> None:
-    """Write subtitle cues to a WebVTT file, compacting short adjacent cues."""
+def write_vtt_cues(segments: list[dict], output_path: str) -> None:
+    """Write word-level timings to a WebVTT file as compacted subtitle lines."""
 
-    cues = compact_vtt_cues(subtitle_cues)
+    cues = build_vtt_words(segments)
 
     lines = ["WEBVTT", ""]
     for cue in cues:
@@ -697,7 +728,7 @@ if __name__ == "__main__":
                 lang_iso = _language_to_iso(result.get("language")) if "language" in result else None
                 lang_suffix = f".{lang_iso}" if lang_iso else ""
                 output_vtt = _unique_path(os.path.join(output_dir, f"{stem}{lang_suffix}.vtt"))
-                write_vtt_cues(result['subtitle_cues'], output_vtt)
+                write_vtt_cues(segments, output_vtt)
                 print(f"Wrote {output_vtt}")
 
             if not args.vtt_only:
