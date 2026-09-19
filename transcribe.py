@@ -515,6 +515,88 @@ def stop_openasr_server(proc: subprocess.Popen):
         pass
 
 
+def transcribe_request(
+    model: str,
+    filename: str,
+    mime_type: str,
+    word_granularity: str,
+    timeout: float,
+    port: int = 8080,
+    verbose: bool = False,
+) -> tuple[bytes, float]:
+    """Send the main transcription request, returning (result_bytes, elapsed).
+
+    elapsed is the seconds taken by the successful request. 429/409 responses
+    are retried and ignored: a failed attempt never contributes a timing.
+    """
+    session_id = str(uuid.uuid4())
+
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=poll_progress,
+        args=(session_id, stop_event, port),
+        daemon=True,
+    )
+    t.start()
+    try:
+        with open(filename, "rb") as f:
+            file_bytes = f.read()
+
+        fields = {
+            "model": model,
+            "response_format": "verbose_json",
+            "timestamp_granularities[]": ["segment", word_granularity],
+            "transcription_id": session_id,
+        }
+        if verbose:
+            print(fields)
+        body, content_type = _encode_multipart(fields, ("file", (filename, file_bytes, mime_type)))
+
+        url = f"http://127.0.0.1:{port}/v1/audio/transcriptions"
+        max_retries = 6
+        attempt = 0
+        while True:
+            req = urllib.request.Request(url, data=body, method="POST")
+            req.add_header("Content-Type", content_type)
+            start = time.monotonic()
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    result_bytes = resp.read()
+                return result_bytes, time.monotonic() - start
+            except urllib.error.HTTPError as e:
+                if (e.code == 429 or e.code == 409) and attempt < max_retries - 1:
+                    attempt += 1
+                    if verbose:
+                        error_body = e.read()
+                        try:
+                            err_obj = json.loads(error_body.decode())
+                            error_msg = err_obj.get("error", {}).get("message", str(e))
+                        except Exception:
+                            error_msg = error_body.decode(errors="ignore")
+                        print(f"HTTP {e.code}: {error_msg}, retrying {attempt}/{max_retries - 1}...", file=sys.stderr)
+                    time.sleep(0.5 * attempt)
+                    continue
+                error_body = e.read()
+                try:
+                    err_obj = json.loads(error_body.decode())
+                    error = err_obj.get("error", {})
+                except Exception:
+                    error = {"message": error_body.decode(errors="ignore")}
+                raise RuntimeError(f"Transcription failed: {error}")
+    finally:
+        stop_event.set()
+        try:
+            t.join(timeout=1.0)
+        except KeyboardInterrupt:
+            pass
+
+
+def benchmark_summary(path: str, elapsed_times: list[float]) -> str:
+    """One-line summary of the per-run elapsed times for a benchmark file."""
+    times = ", ".join(f"{t:.3f}" for t in elapsed_times)
+    return f"Benchmark elapsed times for {path} (s): [{times}]"
+
+
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(prog='transcribe', description='Transcribes audio using OpenASR.')
@@ -530,6 +612,7 @@ if __name__ == "__main__":
     parser.add_argument('-v', '--verbose', action='store_true', help='Print OpenASR server output')
     parser.add_argument('--vtt-only', action='store_true', help='Only output .vtt file, skip .json')
     parser.add_argument('--json-only', action='store_true', help='Only output .json file, skip .vtt')
+    parser.add_argument('--benchmark', action='store_true', help='Repeat the transcription 3 times and print the elapsed time (seconds) of each successful transcribe request; 429/409 failures are retried and not counted')
     
     args, unknown_args = parser.parse_known_args()
     
@@ -665,67 +748,27 @@ if __name__ == "__main__":
             else:
                 output_dir = os.path.dirname(filename) or "."
 
-            session_id = str(uuid.uuid4())
-
-            stop_event = threading.Event()
-            t = threading.Thread(
-                target=poll_progress,
-                args=(session_id, stop_event, args.port),
-                daemon=True,
-            )
-            t.start()
-
-            with open(filename, "rb") as f:
-                file_bytes = f.read()
-
-            fields = {
-                "model": args.model,
-                "response_format": "verbose_json",
-                "timestamp_granularities[]": ["segment", word_granularity],
-                "transcription_id": session_id,
-            }
-            if args.verbose:
-                print(fields)
-            body, content_type = _encode_multipart(fields, ("file", (filename, file_bytes, mime_type)))
-
-            url = f"http://127.0.0.1:{args.port}/v1/audio/transcriptions"
-            req = urllib.request.Request(url, data=body, method="POST")
-            req.add_header("Content-Type", content_type)
-            max_retries = 6
-            attempt = 0
-            last_error = None
-            while True:
-                try:
-                    with urllib.request.urlopen(req, timeout=client_timeout) as resp:
-                        status = resp.status
-                        result_bytes = resp.read()
-                    break
-                except urllib.error.HTTPError as e:
-                    if (e.code == 429 or e.code == 409) and attempt < max_retries - 1:
-                        attempt += 1
-                        if args.verbose:
-                            error_body = e.read()
-                            try:
-                                err_obj = json.loads(error_body.decode())
-                                error_msg = err_obj.get("error", {}).get("message", str(e))
-                            except Exception:
-                                error_msg = error_body.decode(errors="ignore")
-                            print(f"429 Too Many Requests, retrying {attempt}/{max_retries - 1}...", file=sys.stderr)
-                        time.sleep(0.5 * attempt)
-                        continue
-                    error_body = e.read()
-                    try:
-                        err_obj = json.loads(error_body.decode())
-                        error = err_obj.get("error", {})
-                    except Exception:
-                        error = {"message": error_body.decode(errors="ignore")}
-                    raise RuntimeError(f"Transcription failed: {error}")
-
-            stop_event.set()
-            try:
-                t.join(timeout=1.0)
-            except KeyboardInterrupt:
-                pass
+            # Run the main transcribe request once normally, or 3 times with
+            # --benchmark. Only successful requests are timed: 429/409
+            # responses are retried inside transcribe_request and ignored for
+            # the elapsed-time list.
+            runs = 3 if args.benchmark else 1
+            elapsed_times = []
+            for run in range(1, runs + 1):
+                if args.benchmark and args.verbose:
+                    print(f"Benchmark run {run}/{runs}")
+                result_bytes, elapsed = transcribe_request(
+                    model=args.model,
+                    filename=filename,
+                    mime_type=mime_type,
+                    word_granularity=word_granularity,
+                    timeout=client_timeout,
+                    port=args.port,
+                    verbose=args.verbose,
+                )
+                elapsed_times.append(elapsed)
+                if args.verbose:
+                    print(f"Transcribe request elapsed: {elapsed:.3f} seconds")
 
             print()
             result = json.loads(result_bytes)
@@ -737,6 +780,8 @@ if __name__ == "__main__":
                     os.unlink(temp_audio)
                     shutil.rmtree(os.path.dirname(temp_audio), ignore_errors=True)
                     temp_audio = None
+                if args.benchmark:
+                    print(benchmark_summary(source_path, elapsed_times))
                 continue
             words = result.get("words", [])
 
@@ -757,6 +802,9 @@ if __name__ == "__main__":
                 os.unlink(temp_audio)
                 shutil.rmtree(os.path.dirname(temp_audio), ignore_errors=True)
                 temp_audio = None
+
+            if args.benchmark:
+                print(benchmark_summary(source_path, elapsed_times))
     finally:
         if temp_audio is not None and os.path.exists(temp_audio):
             os.unlink(temp_audio)

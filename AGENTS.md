@@ -28,6 +28,7 @@ Other flags:
 - `--openasr-path` overrides binary search.
 - `--ffprobe-path` path to ffprobe directory.
 - `--timeout-multiplier` default 0.25, multiplied by audio duration +10s for HTTP timeout.
+- `--benchmark` repeats the main transcribe request 3 times per file and prints the list of elapsed times (seconds) of the successful requests; 429/409 responses are retried and not counted for timing.
 
 ## Notes
 - Script polls `/v1/audio/transcriptions/{session_id}/progress` and retries 429 up to 3 times.
