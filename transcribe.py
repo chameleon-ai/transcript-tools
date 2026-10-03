@@ -202,14 +202,14 @@ SENTENCE_END_PUNCT = {'.', '!', '?'}
 # VTT lines are built from word-level timings (the subtitle_cues endpoint can
 # drop words, the word list never does). Target line quality: a block over
 # either MAX_DUR / MAX_CHARS is split at its widest internal word boundary.
-MIN_DUR = 2.0      # seconds; blocks under this are "fragments" that keep absorbing
-MAX_DUR = 4.5      # target max line duration
-MAX_CHARS = 88     # target max line length (~2 rendered lines of 42 chars)
-GAP_SOFT = 0.5     # max word gap to extend a well-formed block
+MIN_DUR = 2.6      # seconds; blocks under this are "fragments" that keep absorbing
+MAX_DUR = 8.6      # target max line duration
+MAX_CHARS = 110    # target max line length (~2 rendered lines of 55 chars)
+GAP_SOFT = 0.6     # max word gap to extend a well-formed block
 GAP_SHORT = 2.5    # max word gap a fragment block may bridge while it is still short
-HARD_DUR = 6.5     # absolute cap a single block may reach
-HARD_CHARS = 110   # absolute char cap for a single block
-MIN_PIECE = 0.8    # seconds; never split a block into a shorter line
+HARD_DUR = 9.2     # absolute cap a single block may reach
+HARD_CHARS = 150   # absolute char cap for a single block
+MIN_PIECE = 1.5    # seconds; never split a block into a shorter line
 
 
 def _segment_words(segment: dict) -> list[dict]:
@@ -277,14 +277,15 @@ def _split_block(parts: list[dict], out: list[dict]) -> None:
         if left_dur < MIN_PIECE or right_dur < MIN_PIECE:
             continue
         sentence_end = 1 if parts[k - 1]["word"].rstrip()[-1:] in SENTENCE_END_PUNCT else 0
+        comma_end = 1 if parts[k - 1]["word"].rstrip()[-1:] in {",", ";", ":"} else 0
         candidates.append(
-            (sentence_end, parts[k]["gap"], -abs(left_dur - right_dur), k)
+            (sentence_end, comma_end, parts[k]["gap"], -abs(left_dur - right_dur), k)
         )
     if not candidates:
         out.append({"start": start, "end": end, "text": text})
         return
 
-    k = max(candidates)[3]
+    k = max(candidates)[4]
     _split_block(parts[:k], out)
     _split_block(parts[k:], out)
 
@@ -605,14 +606,14 @@ if __name__ == "__main__":
 
     parser.add_argument('--ffmpeg-path', type=str, default=None, help='Path to ffmpeg. If not specified, it is presumed that ffmpeg is in your PATH.')
     parser.add_argument('--ffprobe-path', type=str, default=None, help='Path to ffprobe. If not specified, it is presumed that ffprobe is in your PATH.')
-    parser.add_argument('-m', '--model', type=str, default='qwen3-asr-1.7b', choices=model_list, help='Run through all calculations but do not render the video.')
+    parser.add_argument('-m', '--model', type=str, default='whisper-large-v3-turbo', choices=model_list, help='Run through all calculations but do not render the video.')
     parser.add_argument('--openasr-path', type=str, default=None, help='Path to openasr binary. If not specified, will search PATH for openasr command (resolves aliases via shutil.which) or fail.')
     parser.add_argument('--port', type=int, default=8080, help='Port to run OpenASR server on')
     parser.add_argument('--timeout-multiplier',type=float, default=0.25, help='Multiply the audio duration by this value to determine the http request timeout. Value < 1 means it is expected to complete faster than real time.')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print OpenASR server output')
     parser.add_argument('--vtt-only', action='store_true', help='Only output .vtt file, skip .json')
     parser.add_argument('--json-only', action='store_true', help='Only output .json file, skip .vtt')
-    parser.add_argument('--benchmark', action='store_true', help='Repeat the transcription 3 times and print the elapsed time (seconds) of each successful transcribe request; 429/409 failures are retried and not counted')
+    parser.add_argument('--benchmark', action='store_true', help='Repeat the transcription 5 times and print the elapsed time (seconds) of each successful transcribe request; Output files are not generated.')
     
     args, unknown_args = parser.parse_known_args()
     
@@ -752,7 +753,7 @@ if __name__ == "__main__":
             # --benchmark. Only successful requests are timed: 429/409
             # responses are retried inside transcribe_request and ignored for
             # the elapsed-time list.
-            runs = 3 if args.benchmark else 1
+            runs = 5 if args.benchmark else 1
             elapsed_times = []
             for run in range(1, runs + 1):
                 if args.benchmark and args.verbose:
@@ -785,14 +786,14 @@ if __name__ == "__main__":
                 continue
             words = result.get("words", [])
 
-            if not args.json_only:
+            if not args.json_only and not args.benchmark:
                 lang_iso = _language_to_iso(result.get("language")) if "language" in result else None
                 lang_suffix = f".{lang_iso}" if lang_iso else ""
                 output_vtt = _unique_path(os.path.join(output_dir, f"{stem}{lang_suffix}.vtt"))
                 write_vtt_cues(segments, output_vtt)
                 print(f"Wrote {output_vtt}")
 
-            if not args.vtt_only:
+            if not args.vtt_only and not args.benchmark:
                 output_json = _unique_path(os.path.join(output_dir, f"{stem}.json"))
                 write_json_output(result, args.model, output_json)
                 print(f"Wrote {output_json}")
